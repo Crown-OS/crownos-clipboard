@@ -20,6 +20,10 @@ pub enum Ownership {
     Orphaned,
     /// Another client owns the selection; `None` when it must not outlive it.
     Foreign(Option<Arc<Entry>>),
+    /// The owner's source died; `entry` is persisted unless a new owner shows
+    /// up within the grace. Chrome destroys its old source *before* setting
+    /// the new one, so every copy there passes through this state.
+    Vacated(Arc<Entry>),
     /// Our own source owns the selection.
     Ours { echo_pending: bool },
 }
@@ -27,6 +31,8 @@ pub enum Ownership {
 #[derive(Debug)]
 pub enum Reaction {
     Capture,
+    /// Persist the vacated entry once the grace elapses, if it is still vacant.
+    AwaitVacancy,
     Persist(Arc<Entry>),
     Ignore,
 }
@@ -43,7 +49,8 @@ impl Ownership {
             (_, true) => (Self::Capturing, Reaction::Capture),
             (ours @ Self::Ours { echo_pending: true }, false) => (ours, Reaction::Ignore),
             (Self::Capturing, false) => (Self::Orphaned, Reaction::Ignore),
-            (Self::Foreign(Some(entry)), false) => (Self::Empty, Reaction::Persist(entry)),
+            (Self::Foreign(Some(entry)), false) => (Self::Vacated(entry), Reaction::AwaitVacancy),
+            (vacated @ Self::Vacated(_), false) => (vacated, Reaction::Ignore),
             (_, false) => (Self::Empty, Reaction::Ignore),
         };
         *self = next;
@@ -57,7 +64,24 @@ impl Ownership {
                 *self = Self::Foreign(entry);
                 Reaction::Ignore
             }
-            Self::Orphaned => entry.map_or(Reaction::Ignore, Reaction::Persist),
+            Self::Orphaned => match entry {
+                Some(entry) => {
+                    *self = Self::Vacated(entry);
+                    Reaction::AwaitVacancy
+                }
+                None => Reaction::Ignore,
+            },
+            unrelated => {
+                *self = unrelated;
+                Reaction::Ignore
+            }
+        }
+    }
+
+    /// The grace after a vacancy is over: persist if nobody took the selection.
+    pub fn on_grace_elapsed(&mut self) -> Reaction {
+        match mem::take(self) {
+            Self::Vacated(entry) => Reaction::Persist(entry),
             unrelated => {
                 *self = unrelated;
                 Reaction::Ignore
@@ -71,10 +95,16 @@ impl Ownership {
 
     /// Stops a foreign entry from being persisted once its owner goes away.
     pub fn forget(&mut self, doomed: impl FnOnce(&Entry) -> bool) {
-        if let Self::Foreign(entry) = self
-            && entry.as_deref().is_some_and(doomed)
-        {
-            *entry = None;
+        let is_doomed = match self {
+            Self::Foreign(Some(entry)) | Self::Vacated(entry) => doomed(entry),
+            _ => false,
+        };
+        if !is_doomed {
+            return;
+        }
+        match self {
+            Self::Foreign(entry) => *entry = None,
+            _ => *self = Self::Empty,
         }
     }
 }
@@ -112,13 +142,33 @@ mod tests {
         assert!(matches!(ownership.on_selection(true), Reaction::Capture));
     }
 
-    #[test]
-    fn null_after_foreign_persists_the_captured_entry() {
-        let mut ownership = captured_foreign();
-        match ownership.on_selection(false) {
+    fn assert_persists(reaction: Reaction) {
+        match reaction {
             Reaction::Persist(persisted) => assert_eq!(persisted.id, 7),
             other => panic!("expected persist, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn null_after_foreign_persists_the_captured_entry_once_the_grace_elapses() {
+        let mut ownership = captured_foreign();
+        assert!(matches!(
+            ownership.on_selection(false),
+            Reaction::AwaitVacancy
+        ));
+        assert_persists(ownership.on_grace_elapsed());
+        assert!(matches!(ownership.on_grace_elapsed(), Reaction::Ignore));
+    }
+
+    #[test]
+    fn source_swapped_by_its_owner_is_captured_not_reverted() {
+        let mut ownership = captured_foreign();
+        assert!(matches!(
+            ownership.on_selection(false),
+            Reaction::AwaitVacancy
+        ));
+        assert!(matches!(ownership.on_selection(true), Reaction::Capture));
+        assert!(matches!(ownership.on_grace_elapsed(), Reaction::Ignore));
     }
 
     #[test]
@@ -153,8 +203,9 @@ mod tests {
         assert!(matches!(ownership.on_selection(false), Reaction::Ignore));
         assert!(matches!(
             ownership.on_captured(Some(entry())),
-            Reaction::Persist(_)
+            Reaction::AwaitVacancy
         ));
+        assert_persists(ownership.on_grace_elapsed());
     }
 
     #[test]
@@ -174,5 +225,13 @@ mod tests {
         let mut ownership = captured_foreign();
         ownership.forget(|entry| entry.id == 7);
         assert!(matches!(ownership.on_selection(false), Reaction::Ignore));
+    }
+
+    #[test]
+    fn entries_forgotten_during_the_grace_are_not_persisted() {
+        let mut ownership = captured_foreign();
+        ownership.on_selection(false);
+        ownership.forget(|entry| entry.id == 7);
+        assert!(matches!(ownership.on_grace_elapsed(), Reaction::Ignore));
     }
 }

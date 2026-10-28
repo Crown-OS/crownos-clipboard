@@ -1,9 +1,12 @@
 //! The event loop's state: routes selection events through the ownership
 //! state machine to capture, history and our own sources.
 
-use std::{mem, sync::Arc};
+use std::{mem, sync::Arc, time::Duration};
 
-use calloop::LoopHandle;
+use calloop::{
+    LoopHandle, RegistrationToken,
+    timer::{TimeoutAction, Timer},
+};
 use wayland_client::{Proxy, QueueHandle};
 use wayland_protocols::ext::data_control::v1::client::{
     ext_data_control_device_v1::ExtDataControlDeviceV1,
@@ -20,11 +23,16 @@ use crate::{
     wayland::{Globals, offer::OfferMimes},
 };
 
+/// How long a vacated selection waits for its owner's replacement source
+/// before the captured entry is persisted in its place.
+const VACANCY_GRACE: Duration = Duration::from_millis(150);
+
 #[derive(Default)]
 struct Slot {
     ownership: Ownership,
     capture: Option<Capture>,
     source: Option<ExtDataControlSourceV1>,
+    grace: Option<RegistrationToken>,
 }
 
 pub struct Daemon {
@@ -111,16 +119,56 @@ impl Daemon {
         }
         let reaction = self.slot(kind).ownership.on_selection(offer.is_some());
         match (reaction, offer) {
-            (Reaction::Capture, Some(offer)) => self.begin_capture(kind, offer),
+            (Reaction::Capture, Some(offer)) => {
+                self.cancel_grace(kind);
+                self.begin_capture(kind, offer);
+            }
             (reaction, offer) => {
                 offer.inspect(ExtDataControlOfferV1::destroy);
                 if let Some(capture) = &mut self.slot(kind).capture {
                     capture.orphan();
                 }
-                if let Reaction::Persist(entry) = reaction {
-                    self.claim(kind, entry);
-                }
+                self.react(kind, reaction);
             }
+        }
+    }
+
+    fn on_grace_elapsed(&mut self, kind: SelectionKind) {
+        let slot = self.slot(kind);
+        slot.grace = None;
+        let reaction = slot.ownership.on_grace_elapsed();
+        self.react(kind, reaction);
+    }
+
+    fn react(&mut self, kind: SelectionKind, reaction: Reaction) {
+        match reaction {
+            Reaction::Persist(entry) => self.claim(kind, entry),
+            Reaction::AwaitVacancy => self.arm_grace(kind),
+            Reaction::Capture | Reaction::Ignore => {}
+        }
+    }
+
+    fn arm_grace(&mut self, kind: SelectionKind) {
+        self.cancel_grace(kind);
+        let token =
+            self.handle
+                .insert_source(Timer::from_duration(VACANCY_GRACE), move |_, _, daemon| {
+                    daemon.on_grace_elapsed(kind);
+                    TimeoutAction::Drop
+                });
+        match token {
+            Ok(token) => self.slot(kind).grace = Some(token),
+            Err(error) => {
+                log::warn!("cannot defer persisting the {kind:?} selection: {error}");
+                self.on_grace_elapsed(kind);
+            }
+        }
+    }
+
+    fn cancel_grace(&mut self, kind: SelectionKind) {
+        let (slot, handle) = self.slot_and_handle(kind);
+        if let Some(token) = slot.grace.take() {
+            handle.remove(token);
         }
     }
 
@@ -164,9 +212,8 @@ impl Daemon {
         };
         self.slot(kind).capture = None;
         let entry = payloads.map(|payloads| self.keep(kind, payloads));
-        if let Reaction::Persist(entry) = self.slot(kind).ownership.on_captured(entry) {
-            self.claim(kind, entry);
-        }
+        let reaction = self.slot(kind).ownership.on_captured(entry);
+        self.react(kind, reaction);
     }
 
     fn keep(&mut self, kind: SelectionKind, payloads: Payloads) -> Arc<Entry> {
@@ -192,6 +239,7 @@ impl Daemon {
             SelectionKind::Primary => self.device.set_primary_selection(Some(&source)),
         }
         log::debug!("offering entry {} as the {kind:?} selection", entry.id);
+        self.cancel_grace(kind);
         let slot = self.slot(kind);
         slot.ownership.on_claimed();
         if let Some(previous) = slot.source.replace(source) {
